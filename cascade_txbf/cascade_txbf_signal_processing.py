@@ -10,6 +10,12 @@ Converted from MATLAB: cascade_TxBF_signalProcessing.m
 
 import os
 import numpy as np
+import matplotlib
+# Use TkAgg backend for interactive plotting (fallback to Agg if not available)
+try:
+    matplotlib.use('TkAgg')
+except:
+    pass
 import matplotlib.pyplot as plt
 from typing import Dict, Any, Optional, List
 from scipy.io import savemat

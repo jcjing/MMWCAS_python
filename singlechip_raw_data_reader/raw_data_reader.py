@@ -17,6 +17,12 @@ import numpy as np
 from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass, field
 from scipy.io import savemat
+import matplotlib
+# Use TkAgg backend for interactive plotting (fallback to Agg if not available)
+try:
+    matplotlib.use('TkAgg')
+except:
+    pass
 import matplotlib.pyplot as plt
 
 

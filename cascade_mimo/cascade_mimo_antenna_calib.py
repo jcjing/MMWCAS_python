@@ -188,6 +188,12 @@ def run_antenna_calibration(
     
     # Visualization
     if plot_on:
+        import matplotlib
+        # Use TkAgg backend for interactive plotting
+        try:
+            matplotlib.use('TkAgg')
+        except:
+            pass
         import matplotlib.pyplot as plt
         
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))

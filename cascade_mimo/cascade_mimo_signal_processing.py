@@ -18,6 +18,12 @@ This script processes raw ADC data through the following chain:
 
 import os
 import numpy as np
+import matplotlib
+# Use TkAgg backend for interactive plotting (fallback to Agg if not available)
+try:
+    matplotlib.use('TkAgg')
+except:
+    pass
 import matplotlib.pyplot as plt
 from typing import List, Dict, Any, Optional
 from scipy.io import savemat

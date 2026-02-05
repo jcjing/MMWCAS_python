@@ -45,6 +45,12 @@ import time
 import glob
 from scipy.io import savemat
 import numpy as np
+import matplotlib
+# Use TkAgg backend for interactive plotting (fallback to Agg if not available)
+try:
+    matplotlib.use('TkAgg')
+except:
+    pass
 import matplotlib.pyplot as plt
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
