@@ -632,7 +632,8 @@ def run_tx_phase_calibration(
                 target_bin_idx = np.argmax(search_range) + search_bins_skip
                 
                 phase_values_bin[idx_tx, idx_rx, idx_ps] = target_bin_idx
-                phase_values_target_distance[idx_tx, idx_rx, idx_ps] = target_bin_idx * cal_params.rangeResolution
+                # Account for fftshift bin offset
+                phase_values_target_distance[idx_tx, idx_rx, idx_ps] = (target_bin_idx - num_samples_per_chirp // 2) * cal_params.rangeResolution
                 
                 # Record phase at target peak bin
                 phase_values[idx_tx, idx_rx, idx_ps] = np.angle(
