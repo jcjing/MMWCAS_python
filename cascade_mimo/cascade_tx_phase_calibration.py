@@ -248,12 +248,12 @@ def read_bin_file(file_path: str, frame_idx: int, num_sample_per_chirp: int,
     # Convert to complex (I + jQ)
     adc_complex = adc_data[0::2] + 1j * adc_data[1::2]
     
-    # Reshape: (numRXPerDevice, numSamplePerChirp, numChirpPerLoop, numLoops)
-    adc_complex = adc_complex.reshape(num_rx_per_device, num_sample_per_chirp, 
-                                       num_chirp_per_loop, num_loops)
-    
+    # Reshape: (numLoops, numChirpPerLoop, numSamplePerChirp, numRXPerDevice)
+    adc_complex = adc_complex.reshape(num_loops, num_chirp_per_loop, 
+                                   num_sample_per_chirp, num_rx_per_device)
+
     # Permute to: (numSamplePerChirp, numLoops, numRXPerDevice, numChirpPerLoop)
-    adc_complex = np.transpose(adc_complex, (1, 3, 0, 2))
+    adc_complex = np.transpose(adc_complex, (2, 0, 3, 1))
     
     return adc_complex
 
