@@ -14,112 +14,152 @@ from typing import Tuple, Optional
 
 
 def plot_range_azimuth_2d(
-    range_bin_size: float,
-    doppler_fft_out: np.ndarray,
-    num_tx: int,
-    num_rx: int,
-    antenna_azimuth_only: Optional[np.ndarray] = None,
-    log_scale: bool = True,
-    static_only: bool = True,
-    plot_on: bool = True,
-    min_range_bin_keep: int = 5,
-    right_range_bin_discard: int = 20,
-    azimuth_fft_size: int = 64,
+    range_resolution: float,
+    radar_data_pre_3dfft: np.ndarray,
+    TDM_MIMO_numTX: int,
+    numRxAnt: int,
+    antenna_azimuthonly: np.ndarray,
+    LOG: bool = True,
+    STATIC_ONLY: bool = True,
+    PLOT_ON: bool = True,
+    minRangeBinKeep: int = 5,
+    rightRangeBinDiscard: int = 20,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate and optionally plot range-azimuth 2D heatmap.
+    This function exactly matches the MATLAB plot_range_azimuth_2D.m implementation.
     
     Args:
-        range_bin_size: Size of each range bin in meters
-        doppler_fft_out: Doppler FFT output, shape (num_range_bins, num_doppler_bins, num_virtual_antennas)
-        num_tx: Number of TX antennas
-        num_rx: Number of RX antennas
-        antenna_azimuth_only: Antenna indices for azimuth-only processing
-        log_scale: Use log10 scale for magnitude
-        static_only: Process only static (zero-Doppler) targets
-        plot_on: Display the plot
-        min_range_bin_keep: Minimum range bin to keep (skip close-range clutter)
-        right_range_bin_discard: Number of range bins to discard from end
-        azimuth_fft_size: FFT size for azimuth processing
+        range_resolution: range resolution to calculate axis to plot
+        radar_data_pre_3dfft: input 3D matrix, rangeFFT x DopplerFFT x virtualArray
+        TDM_MIMO_numTX: number of TXs used for processing
+        numRxAnt: number of RXs used for processing
+        antenna_azimuthonly: azimuth array ID
+        LOG: 1:plot non-linear scale, ^0.4 by default
+        STATIC_ONLY: 1 = plot heatmap for zero-Doppler; 0 = plot heatmap for nonzero-Doppler
+        PLOT_ON: 1 = plot on; 0 = plot off
+        minRangeBinKeep: start range index to keep
+        rightRangeBinDiscard: number of right most range bins to discard
         
     Returns:
         Tuple of (mag_data_static, mag_data_dynamic, y_axis, x_axis)
     """
-    num_range_bins = doppler_fft_out.shape[0]
-    num_doppler_bins = doppler_fft_out.shape[1]
-    num_virtual_antennas = doppler_fft_out.shape[2]
+    dopplerFFTSize = radar_data_pre_3dfft.shape[1]
+    rangeFFTSize = radar_data_pre_3dfft.shape[0]
+    angleFFTSize = 256
+    # ratio used to decide energy threshold used to pick non-zero Doppler bins
+    ratio = 0.5
+    DopplerCorrection = 0
     
-    # Default antenna indices if not provided
-    if antenna_azimuth_only is None:
-        antenna_azimuth_only = np.arange(min(num_virtual_antennas, num_rx))
+    if DopplerCorrection == 1:
+        # add Doppler correction before generating the heatmap
+        radar_data_pre_3dfft_DopCor = np.zeros_like(radar_data_pre_3dfft)
+        for dopplerInd in range(dopplerFFTSize):
+            deltaPhi = 2 * np.pi * (dopplerInd - dopplerFFTSize / 2) / (TDM_MIMO_numTX * dopplerFFTSize)
+            sig_bin_org = radar_data_pre_3dfft[:, dopplerInd, :]
+            for i_TX in range(TDM_MIMO_numTX):
+                RX_ID = slice(i_TX * numRxAnt, (i_TX + 1) * numRxAnt)
+                corVec = np.exp(-1j * i_TX * deltaPhi)
+                radar_data_pre_3dfft_DopCor[:, dopplerInd, RX_ID] = sig_bin_org[:, RX_ID] * corVec
+        radar_data_pre_3dfft = radar_data_pre_3dfft_DopCor
     
-    # Extract zero-Doppler bin for static targets
-    zero_doppler_idx = num_doppler_bins // 2
+    # Filter to azimuth-only antennas (MATLAB: radar_data_pre_3dfft(:,:,antenna_azimuthonly))
+    radar_data_pre_3dfft = radar_data_pre_3dfft[:, :, antenna_azimuthonly]
     
-    # Select antennas for azimuth processing
-    data_for_azimuth = doppler_fft_out[:, zero_doppler_idx, antenna_azimuth_only]
+    # Angle FFT (MATLAB: fft(radar_data_pre_3dfft, angleFFTSize, 3))
+    radar_data_angle_range = np.fft.fft(radar_data_pre_3dfft, n=angleFFTSize, axis=2)
+    n_angle_fft_size = radar_data_angle_range.shape[2]
+    n_range_fft_size = radar_data_angle_range.shape[0]
     
-    # Apply azimuth FFT
-    azimuth_fft = np.fft.fftshift(
-        np.fft.fft(data_for_azimuth, n=azimuth_fft_size, axis=1),
-        axes=1
-    )
+    # Decide non-zero doppler bins to be used for dynamic range-azimuth heatmap
+    DopplerPower = np.sum(np.mean(np.abs(radar_data_pre_3dfft), axis=2), axis=0)
+    # Exclude DC and adjacent bins: [1:dopplerFFTSize/2-1, dopplerFFTSize/2+3:end]
+    indices_noDC = list(range(0, dopplerFFTSize // 2 - 1)) + list(range(dopplerFFTSize // 2 + 2, dopplerFFTSize))
+    DopplerPower_noDC = DopplerPower[indices_noDC]
+    peakVal = np.max(DopplerPower_noDC)
+    peakInd = np.argmax(DopplerPower_noDC)
+    threshold = peakVal * ratio
+    indSel_noDC = np.where(DopplerPower_noDC > threshold)[0]
     
-    # Calculate magnitude
-    if log_scale:
-        mag_data_static = 10 * np.log10(np.abs(azimuth_fft) ** 2 + 1e-10)
-    else:
-        mag_data_static = np.abs(azimuth_fft)
-    
-    # Process dynamic targets (non-zero Doppler)
-    if not static_only:
-        # Sum magnitude across all Doppler bins except zero
-        dynamic_data = np.sum(np.abs(doppler_fft_out[:, :, antenna_azimuth_only]) ** 2, axis=1)
-        dynamic_data -= np.abs(doppler_fft_out[:, zero_doppler_idx, antenna_azimuth_only]) ** 2
-        
-        # Azimuth FFT for dynamic
-        dynamic_azimuth = np.fft.fftshift(
-            np.fft.fft(np.sqrt(dynamic_data), n=azimuth_fft_size, axis=1),
-            axes=1
-        )
-        
-        if log_scale:
-            mag_data_dynamic = 10 * np.log10(np.abs(dynamic_azimuth) ** 2 + 1e-10)
+    # Map back to original indices
+    indSel = []
+    for ii in indSel_noDC:
+        if ii >= dopplerFFTSize // 2 - 1:
+            indSel.append(ii + 3)
         else:
-            mag_data_dynamic = np.abs(dynamic_azimuth)
+            indSel.append(ii)
+    
+    # Dynamic and static range-azimuth
+    if len(indSel) > 0:
+        radar_data_angle_range_dynamic = np.sum(np.abs(radar_data_angle_range[:, indSel, :]), axis=1)
     else:
-        mag_data_dynamic = np.zeros_like(mag_data_static)
+        radar_data_angle_range_dynamic = np.zeros((n_range_fft_size, n_angle_fft_size))
     
-    # Create axis arrays
-    range_axis = np.arange(num_range_bins) * range_bin_size
-    azimuth_bins = np.arange(azimuth_fft_size) - azimuth_fft_size // 2
-    azimuth_angles = np.arcsin(azimuth_bins / azimuth_fft_size) * 180 / np.pi
+    radar_data_angle_range_Static = np.abs(radar_data_angle_range[:, dopplerFFTSize // 2, :])
     
-    # Calculate x,y coordinates for plotting
-    max_range = range_axis[-right_range_bin_discard] if right_range_bin_discard > 0 else range_axis[-1]
-    y_axis = range_axis[min_range_bin_keep:-right_range_bin_discard] if right_range_bin_discard > 0 else range_axis[min_range_bin_keep:]
-    x_axis = azimuth_angles
+    # Select range indices (MATLAB: minRangeBinKeep:n_range_fft_size-rightRangeBinDiscard)
+    # MATLAB colon operator is inclusive on both ends, Python arange is exclusive on upper bound
+    # MATLAB: 5:492 -> [5, 6, ..., 492] (488 elements)
+    # Python: need arange(5, 493) -> [5, 6, ..., 492] (488 elements)
+    indices_1D = np.arange(minRangeBinKeep, n_range_fft_size - rightRangeBinDiscard + 1)
     
-    # Trim data to valid range
-    if right_range_bin_discard > 0:
-        mag_data_static = mag_data_static[min_range_bin_keep:-right_range_bin_discard, :]
-        mag_data_dynamic = mag_data_dynamic[min_range_bin_keep:-right_range_bin_discard, :]
-    else:
-        mag_data_static = mag_data_static[min_range_bin_keep:, :]
-        mag_data_dynamic = mag_data_dynamic[min_range_bin_keep:, :]
+    # Apply fftshift (MATLAB does this on dimension 2)
+    radar_data_angle_range_dynamic = np.fft.fftshift(radar_data_angle_range_dynamic, axes=1)
+    radar_data_angle_range_Static = np.fft.fftshift(radar_data_angle_range_Static, axes=1)
     
-    if plot_on:
-        plt.figure(figsize=(10, 8))
+    # Create sine and cosine arrays for coordinate transformation
+    d = 1
+    sine_theta = -2 * ((np.arange(-n_angle_fft_size / 2, n_angle_fft_size / 2 + 1)) / n_angle_fft_size) / d
+    cos_theta = np.sqrt(1 - sine_theta**2)
+    
+    # Create meshgrid (MATLAB: meshgrid(indices_1D*range_resolution, sine_theta))
+    R_mat, sine_theta_mat = np.meshgrid(indices_1D * range_resolution, sine_theta)
+    _, cos_theta_mat = np.meshgrid(indices_1D, cos_theta)
+    
+    x_axis = R_mat * cos_theta_mat
+    y_axis = R_mat * sine_theta_mat
+    
+    # Extract magnitude data
+    # MATLAB: mag_data_static = squeeze(abs(radar_data_angle_range_Static(indices_1D+1,[1:end 1])));
+    # Note: [1:end 1] means ALL columns, then append first column - so this wraps the angle dimension
+    # MATLAB indices_1D+1 converts 0-based to 1-based, we use indices_1D directly in Python
+    
+    # First wrap the angle dimension: [1:end 1] means columns [0, 1, 2, ..., end, 0]
+    # After fftshift, we have 256 columns, wrap to get 257 by appending first to end
+    radar_data_angle_range_dynamic_wrapped = np.column_stack([radar_data_angle_range_dynamic, radar_data_angle_range_dynamic[:, 0]])
+    radar_data_angle_range_Static_wrapped = np.column_stack([radar_data_angle_range_Static, radar_data_angle_range_Static[:, 0]])
+    
+    # Then select range bins and take magnitude
+    mag_data_dynamic = np.abs(radar_data_angle_range_dynamic_wrapped[indices_1D, :])
+    mag_data_static = np.abs(radar_data_angle_range_Static_wrapped[indices_1D, :])
+    
+    # Transpose and flip (MATLAB: mag_data' then flipud)
+    mag_data_dynamic = mag_data_dynamic.T
+    mag_data_static = mag_data_static.T
+    mag_data_dynamic = np.flipud(mag_data_dynamic)
+    mag_data_static = np.flipud(mag_data_static)
+    
+    if PLOT_ON:
+        log_plot = LOG
+        if STATIC_ONLY:
+            if log_plot:
+                data_to_plot = (mag_data_static) ** 0.4
+            else:
+                data_to_plot = np.abs(mag_data_static)
+        else:
+            if log_plot:
+                data_to_plot = (mag_data_dynamic) ** 0.4
+            else:
+                data_to_plot = np.abs(mag_data_dynamic)
         
-        # Convert to Cartesian for display
-        extent = [x_axis[0], x_axis[-1], y_axis[0], y_axis[-1]]
-        
-        plt.imshow(mag_data_static, aspect='auto', origin='lower', extent=extent)
-        plt.colorbar(label='Power (dB)' if log_scale else 'Magnitude')
-        plt.xlabel('Azimuth Angle (degrees)')
-        plt.ylabel('Range (m)')
-        plt.title('Range-Azimuth Heatmap (Static Objects)')
-        
+        # MATLAB uses surf(y_axis, x_axis, data) with view(2)
+        # This is equivalent to pcolormesh
+        plt.pcolormesh(y_axis, x_axis, data_to_plot, shading='auto', cmap='jet')
+        plt.colorbar()
+        plt.xlabel('meters')
+        plt.ylabel('meters')
+        plt.title('Range/Azimuth Heat Map')
+    
     return mag_data_static, mag_data_dynamic, y_axis, x_axis
 
 

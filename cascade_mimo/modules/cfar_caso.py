@@ -16,26 +16,43 @@ from dataclasses import dataclass, field
 @dataclass
 class CFARConfig:
     """CFAR detection configuration."""
-    # Range CFAR parameters
-    guardCellsRange: int = 4
-    trainCellsRange: int = 8
-    thresholdScaleRange: float = 10.0  # dB
+    # Detection method
+    detectMethod: int = 1  # 1 = dual-pass CASO-CFAR (range then doppler)
     
-    # Doppler CFAR parameters
-    guardCellsDoppler: int = 2
-    trainCellsDoppler: int = 4
-    thresholdScaleDoppler: float = 10.0  # dB
+    # Number of antennas
+    numAntenna: int = 192
     
-    # General parameters
-    peakGrouping: bool = True
-    maxNumDetections: int = 200
+    # CFAR window parameters [range, doppler]
+    refWinSize: List[int] = field(default_factory=lambda: [8, 4])  # training cells
+    guardWinSize: List[int] = field(default_factory=lambda: [8, 0])  # guard cells
+    K0: List[float] = field(default_factory=lambda: [5.0, 3.0])  # threshold scale (LINEAR, not dB!)
     
-    # Range/velocity resolution for output
-    rangeBinSize: float = 0.0375  # meters
-    dopplerBinSize: float = 0.1  # m/s
+    # Max detection parameters
+    maxEnable: int = 0
     
-    # Antenna configuration for SNR estimation
-    numVirtualAntennas: int = 192
+    # Range/velocity parameters (calculated from radar config)
+    rangeBinSize: float = 0.0  # meters per bin - MUST BE SET
+    velocityBinSize: float = 0.0  # m/s per bin - MUST BE SET
+    dopplerFFTSize: int = 64
+    
+    # Power threshold
+    powerThre: float = 0.0
+    
+    # Cells to discard at edges
+    discardCellLeft: int = 10  # positive frequency range bins
+    discardCellRight: int = 20  # negative frequency range bins
+    
+    # TDM MIMO parameters
+    numRxAnt: int = 4
+    TDM_MIMO_numTX: int = 12
+    antenna_azimuthonly: List[int] = field(default_factory=list)
+    
+    # Velocity extension parameters
+    applyVmaxExtend: int = 0
+    minDisApplyVmaxExtend: float = 10.0  # meters
+    overlapAntenna_ID: np.ndarray = field(default_factory=lambda: np.array([]))
+    overlapAntenna_ID_2TX: np.ndarray = field(default_factory=lambda: np.array([]))
+    overlapAntenna_ID_3TX: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
 @dataclass
@@ -46,228 +63,256 @@ class Detection:
     dopplerInd_org: int = 0
     range: float = 0.0
     doppler: float = 0.0
+    doppler_corr: float = 0.0
+    doppler_corr_overlap: float = 0.0
+    doppler_corr_FFT: float = 0.0
     estSNR: float = 0.0
-    noise: float = 0.0
+    noise_var: float = 0.0
+    bin_val: np.ndarray = field(default_factory=lambda: np.array([]))
     peakVal: float = 0.0
 
 
 class CFARDetector:
     """
     CFAR-CASO (Cell Averaging Smallest Of) detector.
-    
-    Performs 2D CFAR detection on range-Doppler maps.
+    Matches MATLAB implementation exactly.
     """
     
-    def __init__(self, config: Optional[CFARConfig] = None, **kwargs):
-        """
-        Initialize CFAR detector.
-        
-        Args:
-            config: CFARConfig object
-            **kwargs: Alternative way to pass config parameters
-        """
-        if config is not None:
-            self.config = config
-        else:
-            self.config = CFARConfig(**kwargs)
+    def __init__(self, config: CFARConfig):
+        """Initialize CFAR detector with configuration."""
+        self.config = config
     
-    def cfar_1d(self, signal: np.ndarray, 
-                guard_cells: int, train_cells: int,
-                threshold_scale: float = 10.0,
-                wrap_around: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        1D CFAR detection using CA-CFAR.
-        
-        Args:
-            signal: 1D signal magnitude (linear scale)
-            guard_cells: Number of guard cells on each side
-            train_cells: Number of training cells on each side
-            threshold_scale: Threshold scale in dB
-            wrap_around: Whether to wrap around at edges
-            
-        Returns:
-            Tuple of (detection_mask, noise_estimate)
-        """
-        n = len(signal)
-        threshold_linear = 10 ** (threshold_scale / 10)
-        
-        noise_estimate = np.zeros(n)
-        
-        for i in range(n):
-            # Left training cells
-            left_start = i - guard_cells - train_cells
-            left_end = i - guard_cells
-            
-            # Right training cells  
-            right_start = i + guard_cells + 1
-            right_end = i + guard_cells + train_cells + 1
-            
-            if wrap_around:
-                left_indices = np.arange(left_start, left_end) % n
-                right_indices = np.arange(right_start, right_end) % n
-                left_sum = np.sum(signal[left_indices])
-                right_sum = np.sum(signal[right_indices])
-            else:
-                # Handle edges by using available cells
-                left_indices = np.arange(max(0, left_start), max(0, left_end))
-                right_indices = np.arange(min(n, right_start), min(n, right_end))
-                left_sum = np.sum(signal[left_indices]) if len(left_indices) > 0 else 0
-                right_sum = np.sum(signal[right_indices]) if len(right_indices) > 0 else 0
-            
-            # CASO: use smaller of the two sides
-            left_avg = left_sum / max(len(left_indices), 1)
-            right_avg = right_sum / max(len(right_indices), 1)
-            noise_estimate[i] = min(left_avg, right_avg)
-        
-        # Threshold
-        threshold = noise_estimate * threshold_linear
-        detection_mask = signal > threshold
-        
-        return detection_mask, noise_estimate
-    
-    def cfar_range(self, range_doppler: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def CFAR_CASO_Range(self, sig_integrate: np.ndarray) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray]:
         """
         CFAR detection along range dimension.
+        Exact MATLAB translation.
         
         Args:
-            range_doppler: Range-Doppler map, shape (num_range, num_doppler)
+            sig_integrate: Range-Doppler power map (range x doppler)
             
         Returns:
-            Tuple of (detection_mask, noise_estimate)
+            Tuple of (N_obj, Ind_obj, noise_obj, CFAR_SNR)
         """
-        num_range, num_doppler = range_doppler.shape
-        detection_mask = np.zeros_like(range_doppler, dtype=bool)
-        noise_estimate = np.zeros_like(range_doppler)
+        cellNum = self.config.refWinSize[0]
+        gapNum = self.config.guardWinSize[0]
+        K0 = self.config.K0[0]  # LINEAR scale, not dB!
         
-        for d in range(num_doppler):
-            mask, noise = self.cfar_1d(
-                range_doppler[:, d],
-                self.config.guardCellsRange,
-                self.config.trainCellsRange,
-                self.config.thresholdScaleRange
-            )
-            detection_mask[:, d] = mask
-            noise_estimate[:, d] = noise
+        M_samp, N_pul = sig_integrate.shape
         
-        return detection_mask, noise_estimate
+        gaptot = gapNum + cellNum
+        N_obj = 0
+        Ind_obj = []
+        noise_obj = []
+        CFAR_SNR = []
+        
+        discardCellLeft = self.config.discardCellLeft
+        discardCellRight = self.config.discardCellRight
+        
+        # For each Doppler bin
+        for k in range(N_pul):
+            sigv = sig_integrate[:, k]
+            vec = sigv[discardCellLeft:M_samp-discardCellRight]
+            
+            # Wrap edges
+            vecLeft = vec[:gaptot]
+            vecRight = vec[-gaptot:]
+            vec = np.concatenate([vecLeft, vec, vecRight])
+            
+            # Process each range bin
+            for j in range(M_samp - discardCellLeft - discardCellRight):
+                # Cell indices (MATLAB 1-indexed, converted to 0-indexed)
+                cellInda = np.arange(j - gaptot, j - gapNum) + gaptot
+                cellIndb = np.arange(j + gapNum + 1, j + gaptot + 1) + gaptot
+                
+                # CASO: take minimum of left and right averages
+                cellave1a = np.sum(vec[cellInda]) / cellNum
+                cellave1b = np.sum(vec[cellIndb]) / cellNum
+                cellave1 = min(cellave1a, cellave1b)
+                
+                # Detection logic
+                if self.config.maxEnable == 1:
+                    # Check if local maximum
+                    cellInd = np.concatenate([cellInda, cellIndb])
+                    maxInCell = np.max(vec[cellInd])
+                    if vec[j + gaptot] > K0 * cellave1 and vec[j + gaptot] >= maxInCell:
+                        N_obj += 1
+                        Ind_obj.append([j + discardCellLeft, k])
+                        noise_obj.append(cellave1)
+                        CFAR_SNR.append(vec[j + gaptot] / cellave1)
+                else:
+                    if vec[j + gaptot] > K0 * cellave1:
+                        N_obj += 1
+                        Ind_obj.append([j + discardCellLeft, k])
+                        noise_obj.append(cellave1)
+                        CFAR_SNR.append(vec[j + gaptot] / cellave1)
+        
+        Ind_obj = np.array(Ind_obj) if len(Ind_obj) > 0 else np.array([]).reshape(0, 2)
+        noise_obj = np.array(noise_obj)
+        CFAR_SNR = np.array(CFAR_SNR)
+        
+        return N_obj, Ind_obj, noise_obj, CFAR_SNR
     
-    def cfar_doppler(self, range_doppler: np.ndarray, 
-                     range_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def CFAR_CASO_Doppler_overlap(self, Ind_obj_Rag: np.ndarray, sigCpml: np.ndarray, 
+                                   sig_integ: np.ndarray) -> Tuple[int, np.ndarray]:
         """
-        CFAR detection along Doppler dimension for range cells that passed.
+        CFAR detection along Doppler dimension for cells that passed range detection.
+        Exact MATLAB translation.
         
         Args:
-            range_doppler: Range-Doppler map, shape (num_range, num_doppler)
-            range_mask: Mask of detections from range CFAR
+            Ind_obj_Rag: Range detection indices (N x 2: [range_idx, doppler_idx])
+            sigCpml: Complex signal (range x doppler x antenna)
+            sig_integ: Integrated power (range x doppler)
             
         Returns:
-            Tuple of (detection_mask, noise_estimate)
+            Tuple of (N_obj, Ind_obj)
         """
-        num_range, num_doppler = range_doppler.shape
-        detection_mask = np.zeros_like(range_doppler, dtype=bool)
-        noise_estimate = np.zeros_like(range_doppler)
+        maxEnable = self.config.maxEnable
+        cellNum = self.config.refWinSize[1]
+        gapNum = self.config.guardWinSize[1]
+        K0 = self.config.K0[1]  # LINEAR scale
         
-        # Only process range bins with detections
-        range_indices = np.any(range_mask, axis=1)
+        M_samp, N_pul = sig_integ.shape
+        gaptot = gapNum + cellNum
         
-        for r in np.where(range_indices)[0]:
-            mask, noise = self.cfar_1d(
-                range_doppler[r, :],
-                self.config.guardCellsDoppler,
-                self.config.trainCellsDoppler,
-                self.config.thresholdScaleDoppler,
-                wrap_around=True  # Doppler wraps around
-            )
-            detection_mask[r, :] = mask & range_mask[r, :]
-            noise_estimate[r, :] = noise
+        # Extract unique range bins with detections
+        detected_Rag_Cell = np.unique(Ind_obj_Rag[:, 0])
+        sig = sig_integ[detected_Rag_Cell, :]
         
-        return detection_mask, noise_estimate
-    
-    def peak_grouping(self, range_doppler: np.ndarray,
-                      detection_mask: np.ndarray) -> np.ndarray:
-        """
-        Group nearby detections and keep only peaks.
+        M_samp = sig.shape[0]
+        N_pul = sig.shape[1]
         
-        Args:
-            range_doppler: Range-Doppler map
-            detection_mask: Boolean detection mask
+        N_obj = 0
+        Ind_obj = []
+        
+        # For each detected range bin
+        for k in range(M_samp):
+            detected_Rag_Cell_i = detected_Rag_Cell[k]
             
-        Returns:
-            Grouped detection mask
-        """
-        from scipy.ndimage import label, maximum_filter
+            # Find Doppler indices detected in range CFAR for this range bin
+            ind1 = np.where(Ind_obj_Rag[:, 0] == detected_Rag_Cell_i)[0]
+            indR = Ind_obj_Rag[ind1, 1]
+            
+            # Wrap vector for circular Doppler processing
+            sigv = sig[k, :]
+            vec = np.zeros(N_pul + gaptot * 2)
+            vec[:gaptot] = sigv[-gaptot:]
+            vec[gaptot:N_pul + gaptot] = sigv
+            vec[N_pul + gaptot:] = sigv[:gaptot]
+            
+            # Process each Doppler bin
+            ind_loc_all = []
+            ind_loc_Dop = []
+            
+            for j in range(gaptot, N_pul + gaptot):
+                j0 = j - gaptot
+                
+                cellInda = np.arange(j - gaptot, j - gapNum)
+                cellIndb = np.arange(j + gapNum + 1, j + gaptot + 1)
+                
+                # CASO: minimum of left and right
+                cellave1a = np.sum(vec[cellInda]) / cellNum
+                cellave1b = np.sum(vec[cellIndb]) / cellNum
+                cellave1 = min(cellave1a, cellave1b)
+                
+                # Detection condition
+                if maxEnable == 1:
+                    cellInd = np.concatenate([cellInda, cellIndb])
+                    maxInCell = np.max(vec[cellInd])
+                    condition = (vec[j] > K0 * cellave1) and (vec[j] > maxInCell)
+                else:
+                    condition = vec[j] > K0 * cellave1
+                
+                # Check if this overlaps with range detection
+                if condition and (j0 in indR):
+                    ind_loc_all.append(detected_Rag_Cell_i)
+                    ind_loc_Dop.append(j0)
+            
+            # Add detections, avoiding duplicates
+            if len(ind_loc_all) > 0:
+                ind_obj_0 = np.column_stack([ind_loc_all, ind_loc_Dop])
+                
+                if len(Ind_obj) == 0:
+                    Ind_obj = ind_obj_0.tolist()
+                else:
+                    # Check for duplicates
+                    Ind_obj_sum = [r[0] + 10000 * r[1] for r in Ind_obj]
+                    for ii in range(len(ind_loc_all)):
+                        ind_sum = ind_loc_all[ii] + 10000 * ind_loc_Dop[ii]
+                        if ind_sum not in Ind_obj_sum:
+                            Ind_obj.append([ind_loc_all[ii], ind_loc_Dop[ii]])
         
-        # Label connected regions
-        labeled, num_features = label(detection_mask)
+        N_obj = len(Ind_obj)
+        Ind_obj = np.array(Ind_obj) if N_obj > 0 else np.array([]).reshape(0, 2)
         
-        # Find local maxima
-        local_max = maximum_filter(range_doppler, size=3) == range_doppler
-        
-        # Keep only local maxima within detection regions
-        grouped_mask = detection_mask & local_max
-        
-        return grouped_mask
+        return N_obj, Ind_obj
     
-    def detect(self, doppler_fft_out: np.ndarray) -> List[Detection]:
+    def datapath(self, input_signal: np.ndarray) -> List[Detection]:
         """
-        Perform 2D CFAR detection.
+        Main CFAR datapath matching MATLAB.
         
         Args:
-            doppler_fft_out: Doppler FFT output, shape (num_range, num_doppler, num_antennas)
+            input_signal: 3D array (range x doppler x antenna)
             
         Returns:
             List of Detection objects
         """
-        # Sum power across antennas
-        power = np.sum(np.abs(doppler_fft_out) ** 2, axis=2)
+        # Non-coherent integration across antennas (power sum)
+        sig_integrate = np.sum(np.abs(input_signal) ** 2, axis=2) + 1
         
-        num_range, num_doppler = power.shape
+        detection_results = []
         
-        # Range CFAR
-        range_mask, range_noise = self.cfar_range(power)
-        
-        # Doppler CFAR
-        detection_mask, doppler_noise = self.cfar_doppler(power, range_mask)
-        
-        # Peak grouping
-        if self.config.peakGrouping:
-            detection_mask = self.peak_grouping(power, detection_mask)
-        
-        # Extract detections
-        detections = []
-        range_inds, doppler_inds = np.where(detection_mask)
-        
-        for i, (r, d) in enumerate(zip(range_inds, doppler_inds)):
-            if len(detections) >= self.config.maxNumDetections:
-                break
+        if self.config.detectMethod == 1:  # Dual-pass CASO-CFAR
+            # First pass: Range CFAR
+            N_obj_Rag, Ind_obj_Rag, noise_obj, CFAR_SNR = self.CFAR_CASO_Range(sig_integrate)
             
-            # Calculate SNR
-            signal_power = power[r, d]
-            noise_power = doppler_noise[r, d]
-            snr = 10 * np.log10(signal_power / (noise_power + 1e-10))
-            
-            # Convert indices to physical values
-            range_val = r * self.config.rangeBinSize
-            doppler_org = d - num_doppler // 2
-            doppler_val = doppler_org * self.config.dopplerBinSize
-            
-            det = Detection(
-                rangeInd=r,
-                dopplerInd=d,
-                dopplerInd_org=doppler_org,
-                range=range_val,
-                doppler=doppler_val,
-                estSNR=snr,
-                noise=noise_power,
-                peakVal=signal_power
-            )
-            detections.append(det)
+            if N_obj_Rag > 0:
+                # Second pass: Doppler CFAR
+                N_obj, Ind_obj = self.CFAR_CASO_Doppler_overlap(Ind_obj_Rag, input_signal, sig_integrate)
+                
+                # Build aggregate noise from first pass
+                noise_obj_agg = np.zeros(N_obj)
+                for i_obj in range(N_obj):
+                    indx1R = Ind_obj[i_obj, 0]
+                    indx1D = Ind_obj[i_obj, 1]
+                    
+                    # Find matching detection in range pass
+                    ind2R = np.where(Ind_obj_Rag[:, 0] == indx1R)[0]
+                    ind2D = np.where(Ind_obj_Rag[ind2R, 1] == indx1D)[0]
+                    if len(ind2D) > 0:
+                        noiseInd = ind2R[ind2D[0]]
+                        noise_obj_agg[i_obj] = noise_obj[noiseInd]
+                
+                # Create Detection objects
+                for i_obj in range(N_obj):
+                    xind = Ind_obj[i_obj, 0]
+                    
+                    det = Detection()
+                    det.rangeInd = Ind_obj[i_obj, 0]
+                    det.range = det.rangeInd * self.config.rangeBinSize
+                    
+                    dopplerInd = Ind_obj[i_obj, 1]
+                    det.dopplerInd_org = dopplerInd
+                    det.dopplerInd = dopplerInd
+                    
+                    # Velocity estimation (Doppler centered at FFTSize/2)
+                    det.doppler = (dopplerInd - self.config.dopplerFFTSize / 2) * self.config.velocityBinSize
+                    det.doppler_corr = det.doppler
+                    det.doppler_corr_overlap = det.doppler
+                    det.doppler_corr_FFT = det.doppler
+                    
+                    det.noise_var = noise_obj_agg[i_obj]
+                    
+                    # Extract bin values for all antennas
+                    bin_val = input_signal[xind, dopplerInd, :].reshape(-1)
+                    det.bin_val = bin_val
+                    
+                    # Estimate SNR
+                    det.estSNR = np.sum(np.abs(bin_val) ** 2) / max(det.noise_var, 1e-10)
+                    det.peakVal = sig_integrate[xind, dopplerInd]
+                    
+                    detection_results.append(det)
         
-        return detections
-    
-    def datapath(self, doppler_fft_out: np.ndarray) -> List[Detection]:
-        """MATLAB-compatible datapath interface."""
-        return self.detect(doppler_fft_out)
+        return detection_results
 
 
 def cfar_2d(range_doppler: np.ndarray,

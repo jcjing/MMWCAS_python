@@ -42,8 +42,8 @@ TI_CASCADE_ANTENNA_DESIGN_FREQ = 76.8
 # Default Processing Parameters
 # ==============================================================================
 
-# Calibration interpolation factor
-DEFAULT_CALIBRATION_INTERP = 5
+# Calibration interpolation factor (matches MATLAB default)
+DEFAULT_CALIBRATION_INTERP = 7
 
 # Scale factors for various calculations
 SCALE_FACTORS = np.array([

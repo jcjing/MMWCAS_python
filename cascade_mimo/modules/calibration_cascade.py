@@ -34,11 +34,12 @@ class CalibrationConfig:
     IdTxForMIMOProcess: List[int] = field(default_factory=list)
     Slope_calib: float = 0.0
     Sampling_Rate_sps: float = 0.0
+    chirpSlope: float = 0.0
     calibrationInterp: int = 5
     dataPlatform: str = 'TDA2'
     NumDevices: int = 4
     adcCalibrationOn: bool = True
-    phaseCalibOnly: bool = False
+    phaseCalibOnly: bool = True  # 1: only phase calibration; 0: phase and amplitude calibration
 
 
 class CalibrationCascade:
@@ -130,66 +131,101 @@ class CalibrationCascade:
         
         return radar_data
     
-    def apply_calibration(self, adc_data: np.ndarray) -> np.ndarray:
-        """
-        Apply calibration to ADC data.
-        
-        Args:
-            adc_data: Raw ADC data, shape (samples, chirps, rx, tx)
-            
-        Returns:
-            Calibrated ADC data
-        """
-        if not self.config.adcCalibrationOn:
-            return adc_data
-        
-        calibrated = adc_data.copy()
-        
-        # Apply phase calibration
-        if self.phase_calib_matrix is not None:
-            # Phase calibration is applied per RX-TX virtual antenna
-            num_rx = adc_data.shape[2]
-            num_tx = adc_data.shape[3] if adc_data.ndim > 3 else 1
-            
-            for rx in range(num_rx):
-                for tx in range(num_tx):
-                    if tx < self.phase_calib_matrix.shape[0] and rx < self.phase_calib_matrix.shape[1]:
-                        phase_correction = np.exp(-1j * np.angle(self.phase_calib_matrix[tx, rx]))
-                        if adc_data.ndim > 3:
-                            calibrated[:, :, rx, tx] *= phase_correction
-                        else:
-                            calibrated[:, :, rx] *= phase_correction
-        
-        # Apply frequency calibration (range-dependent phase correction)
-        if self.freq_calib_matrix is not None and not self.config.phaseCalibOnly:
-            # Frequency calibration corrects for path length differences
-            num_samples = adc_data.shape[0]
-            for sample in range(num_samples):
-                if sample < self.freq_calib_matrix.shape[0]:
-                    freq_correction = self.freq_calib_matrix[sample]
-                    calibrated[sample] *= freq_correction
-        
-        return calibrated
-    
     def datapath(self) -> np.ndarray:
         """
         MATLAB-compatible datapath interface.
         
-        Reads ADC data and applies calibration.
+        Reads ADC data and applies calibration exactly as MATLAB does.
         
         Returns:
-            Calibrated ADC data
+            Calibrated ADC data with shape (samples, loops, rx, tx)
         """
-        adc_data = self.read_adc_data()
+        # Read raw ADC data
+        radar_data_rxchain = self.read_adc_data()
+        
+        # If calibration is off, return raw data
+        if not self.config.adcCalibrationOn or self.calib_data is None:
+            # Reorder RX channels
+            if self.config.RxForMIMOProcess:
+                rx_order = [rx - 1 for rx in self.config.RxForMIMOProcess if rx - 1 < radar_data_rxchain.shape[2]]
+                radar_data_rxchain = radar_data_rxchain[:, :, rx_order, :]
+            return radar_data_rxchain
+        
+        # Extract calibration matrices
+        calib_result = self.calib_data['calibResult'][0, 0] if isinstance(self.calib_data['calibResult'], np.ndarray) else self.calib_data['calibResult']
+        RangeMat = calib_result['RangeMat']
+        PeakValMat = calib_result['PeakValMat']
+        
+        # Get parameters (need these from config)
+        numSamplePerChirp = self.config.numSamplePerChirp
+        nchirp_loops = self.config.nchirp_loops
+        TxToEnable = self.config.TxToEnable
+        calibrationInterp = self.config.calibrationInterp
+        phaseCalibOnly = self.config.phaseCalibOnly
+        
+        # Need slope and sampling rate from params
+        if 'params' in self.calib_data:
+            params = self.calib_data['params'][0, 0] if isinstance(self.calib_data['params'], np.ndarray) else self.calib_data['params']
+            Slope_calib = params['Slope_MHzperus'] * 1e12  # Convert to Hz/s
+            fs_calib = Sampling_Rate_sps = params['Sampling_Rate_sps']
+        else:
+            # Fallback - these should be set in config
+            Slope_calib = getattr(self.config, 'Slope_calib', 12.022e12)
+            Sampling_Rate_sps = fs_calib = getattr(self.config, 'Sampling_Rate_sps', 11.11e6)
+        
+        # Get chirp slope from config (current system's slope)
+        chirpSlope = getattr(self.config, 'chirpSlope', Slope_calib)
+        
+        numTX = len(TxToEnable)
+        outData = np.zeros_like(radar_data_rxchain)
+        
+        # Use first TX as reference (MATLAB uses TxToEnable(1))
+        TX_ref = TxToEnable[0]
+        
+        # Apply calibration per TX
+        for iTX in range(numTX):
+            # MATLAB uses 1-indexed TxToEnable
+            TXind = TxToEnable[iTX]
+            
+            # Construct frequency compensation matrix
+            # freq_calib = (RangeMat(TXind,:)-RangeMat(TX_ref,1))*fs_calib/Sampling_Rate_sps *chirpSlope/Slope_calib
+            freq_calib = (RangeMat[TXind-1, :] - RangeMat[TX_ref-1, 0]) * fs_calib / Sampling_Rate_sps * chirpSlope / Slope_calib
+            freq_calib = 2 * np.pi * freq_calib / (numSamplePerChirp * calibrationInterp)
+            
+            # correction_vec = exp(1i*((0:numSamplePerChirp-1)'*freq_calib))'
+            sample_indices = np.arange(numSamplePerChirp).reshape(-1, 1)
+            correction_vec = np.exp(1j * (sample_indices @ freq_calib.reshape(1, -1)))
+            
+            # freq_correction_mat = repmat(correction_vec, 1, 1, nchirp_loops)
+            # freq_correction_mat = permute(freq_correction_mat, [2 3 1])
+            # Shape: (samples, rx) -> (samples, loops, rx)
+            freq_correction_mat = np.tile(correction_vec[:, np.newaxis, :], (1, nchirp_loops, 1))
+            
+            # Apply frequency correction
+            outData1TX = radar_data_rxchain[:, :, :, iTX] * freq_correction_mat
+            
+            # Construct phase compensation matrix
+            # phase_calib = PeakValMat(TX_ref,1)./PeakValMat(TXind,:)
+            phase_calib = PeakValMat[TX_ref-1, 0] / PeakValMat[TXind-1, :]
+            
+            # Remove amplitude calibration if phase only
+            if phaseCalibOnly:
+                phase_calib = phase_calib / np.abs(phase_calib)
+            
+            # phase_correction_mat = repmat(phase_calib.', 1,numSamplePerChirp, nchirp_loops)
+            # phase_correction_mat = permute(phase_correction_mat, [2 3 1])
+            # Shape: (rx,) -> (samples, loops, rx)
+            phase_correction_mat = np.tile(phase_calib.reshape(1, 1, -1), (numSamplePerChirp, nchirp_loops, 1))
+            
+            # Apply phase correction
+            outData[:, :, :, iTX] = outData1TX * phase_correction_mat
         
         # Reorder RX channels
         if self.config.RxForMIMOProcess:
-            rx_order = [rx - 1 for rx in self.config.RxForMIMOProcess if rx - 1 < adc_data.shape[2]]
-            adc_data = adc_data[:, :, rx_order, :]
+            rx_order = [rx - 1 for rx in self.config.RxForMIMOProcess if rx - 1 < outData.shape[2]]
+            outData = outData[:, :, rx_order, :]
         
-        calibrated_data = self.apply_calibration(adc_data)
-        
-        return calibrated_data
+        return outData
 
 
 def generate_calibration_matrix(

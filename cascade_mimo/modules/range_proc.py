@@ -19,7 +19,7 @@ class RangeProcConfig:
     rangeFFTSize: int = 256
     numSamplePerChirp: int = 256
     windowType: Literal['hann', 'blackman', 'hamming', 'rect'] = 'hann'
-    scaleFFT: bool = True
+    scaleFFT: bool = False  # Match MATLAB FFTOutScaleOn=0
     rangeResolution: float = 0.0  # meters, calculated from RF params
 
 
@@ -91,15 +91,34 @@ class RangeProcessor:
         Returns:
             Range FFT with shape (rangeFFTSize, num_chirps, num_rx)
         """
-        # Transpose to have samples last
-        # Input: (samples, chirps, rx) -> (chirps, rx, samples)
-        data_transposed = np.transpose(adc_data, (1, 2, 0))
+        num_samples = adc_data.shape[0]
+        num_lines = adc_data.shape[1]
+        num_ant = adc_data.shape[2]
         
-        # Process
-        range_fft = self.process(data_transposed)
+        # Initialize output
+        out = np.zeros((self.config.rangeFFTSize, num_lines, num_ant), dtype=complex)
         
-        # Transpose back: (chirps, rx, range) -> (range, chirps, rx)
-        return np.transpose(range_fft, (2, 0, 1))
+        for i_an in range(num_ant):
+            # Extract antenna data: (samples, chirps)
+            input_mat = adc_data[:, :, i_an]
+            
+            # DC offset compensation - subtract mean along sample axis
+            input_mat = input_mat - np.mean(input_mat, axis=0, keepdims=True)
+            
+            # Apply range-domain windowing
+            input_mat = input_mat * self._window.reshape(-1, 1)
+            
+            # Range FFT along sample axis (axis 0)
+            fft_output = np.fft.fft(input_mat, n=self.config.rangeFFTSize, axis=0)
+            
+            # Apply scaling if enabled
+            if self.config.scaleFFT:
+                fft_output = fft_output * (1.0 / self.config.numSamplePerChirp)
+            
+            # Populate output
+            out[:, :, i_an] = fft_output
+        
+        return out
 
 
 def range_fft(adc_data: np.ndarray, fft_size: int = 256,

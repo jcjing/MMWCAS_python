@@ -189,14 +189,13 @@ class DOACascade:
         
         return az_angle, el_angle, peak_power
     
-    def process_detections(self, detections: List[Detection],
-                          doppler_fft_out: np.ndarray) -> List[AngleEstimate]:
+    def process_detections(self, detections: List[Detection]) -> List[AngleEstimate]:
         """
         Estimate angles for each CFAR detection.
+        MATLAB-compatible: uses bin_val from detections.
         
         Args:
-            detections: List of CFAR detections
-            doppler_fft_out: Doppler FFT data, shape (range, doppler, virtual_ant)
+            detections: List of CFAR detections with bin_val populated
             
         Returns:
             List of AngleEstimate objects
@@ -204,10 +203,10 @@ class DOACascade:
         angle_estimates = []
         
         for det in detections:
-            # Extract signal from all virtual antennas at detection location
-            if det.rangeInd < doppler_fft_out.shape[0] and det.dopplerInd < doppler_fft_out.shape[1]:
-                signal = doppler_fft_out[det.rangeInd, det.dopplerInd, :]
-            else:
+            # Use bin_val from detection (already extracted by CFAR)
+            signal = det.bin_val
+            
+            if len(signal) == 0:
                 continue
             
             # Estimate angles
@@ -219,9 +218,9 @@ class DOACascade:
                 dopplerInd_org=det.dopplerInd_org,
                 range=det.range,
                 doppler=det.doppler,
-                doppler_corr=det.doppler,
-                doppler_corr_overlap=det.doppler,
-                doppler_corr_FFT=det.doppler,
+                doppler_corr=det.doppler_corr,
+                doppler_corr_overlap=det.doppler_corr_overlap,
+                doppler_corr_FFT=det.doppler_corr_FFT,
                 estSNR=det.estSNR,
                 angles=(az_angle, el_angle)
             )
@@ -229,31 +228,17 @@ class DOACascade:
         
         return angle_estimates
     
-    def datapath(self, detections: List[Detection],
-                 doppler_fft_out: Optional[np.ndarray] = None) -> List[AngleEstimate]:
+    def datapath(self, detections: List[Detection]) -> List[AngleEstimate]:
         """
         MATLAB-compatible datapath interface.
         
         Args:
-            detections: List of CFAR detections
-            doppler_fft_out: Optional Doppler FFT data
+            detections: List of CFAR detections with bin_val
             
         Returns:
             List of angle estimates
         """
-        if doppler_fft_out is None:
-            # Just copy detection info without angle estimation
-            return [AngleEstimate(
-                rangeInd=d.rangeInd,
-                dopplerInd=d.dopplerInd,
-                dopplerInd_org=d.dopplerInd_org,
-                range=d.range,
-                doppler=d.doppler,
-                estSNR=d.estSNR,
-                angles=(0.0, 0.0)
-            ) for d in detections]
-        
-        return self.process_detections(detections, doppler_fft_out)
+        return self.process_detections(detections)
 
 
 def angles_to_xyz(range_m: float, azimuth_deg: float, elevation_deg: float) -> Tuple[float, float, float]:

@@ -18,9 +18,9 @@ class DopplerProcConfig:
     """Doppler processing configuration."""
     dopplerFFTSize: int = 64
     numChirpsPerFrame: int = 64
-    windowType: Literal['hann', 'blackman', 'hamming', 'rect'] = 'hann'
-    clutterRemoval: bool = True
-    scaleFFT: bool = True
+    windowType: Literal['hann', 'blackman', 'hamming', 'rect'] = 'rect'  # Match MATLAB dopplerWindowEnable=0
+    clutterRemoval: bool = False  # Match MATLAB clutterRemove=0
+    scaleFFT: bool = False  # Match MATLAB FFTOutScaleOn=0
     dopplerResolution: float = 0.0  # m/s, calculated from RF params
 
 

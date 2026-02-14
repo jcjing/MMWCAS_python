@@ -17,6 +17,7 @@ import glob
 import struct
 import numpy as np
 from typing import List, Tuple, Optional
+import ctypes
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -98,6 +99,86 @@ def get_bin_file_names_with_idx(folder_name: str, file_idx: str) -> FileNameStru
     
     return file_struct
 
+class idx_header(ctypes.Structure):
+    _fields_ = [
+        ("tag", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("numIdx", ctypes.c_uint32),
+        ("dataFileSize", ctypes.c_uint64)
+    ]
+
+    def __repr__(self) -> str:
+        """
+        Returns a detailed, developer-friendly string representation of the structure.
+        """
+        # Collect field names and their current values
+        field_values = []
+        for field in self._fields_:
+            field_name = field[0]
+            value = getattr(self, field_name)
+            # Special handling for ctypes arrays to make them readable
+            if isinstance(value, ctypes.Array):
+                value_repr = list(value)
+            else:
+                value_repr = repr(value)
+            field_values.append(f"{field_name}={value_repr}")
+            
+        # Format the output to look like a valid Python expression
+        return f"{self.__class__.__name__}({', '.join(field_values)})"
+
+class idx_buff(ctypes.Structure):
+    _fields_ = [
+        ("tag", ctypes.c_uint16),
+        ("version", ctypes.c_uint16),
+        ("flags", ctypes.c_uint32),
+        ("width", ctypes.c_uint16),
+        ("height", ctypes.c_uint16),
+        ("pitch_or_meta_size", ctypes.c_uint32 * 4),
+        ("size", ctypes.c_uint32),
+        ("timestamp", ctypes.c_uint32),
+        ("offset", ctypes.c_uint64),
+    ]
+    
+    def __repr__(self) -> str:
+        """
+        Returns a detailed, developer-friendly string representation of the structure.
+        """
+        # Collect field names and their current values
+        field_values = []
+        for field in self._fields_:
+            field_name = field[0]
+            value = getattr(self, field_name)
+            # Special handling for ctypes arrays to make them readable
+            if isinstance(value, ctypes.Array):
+                value_repr = list(value)
+            else:
+                value_repr = repr(value)
+            field_values.append(f"{field_name}={value_repr}")
+            
+        # Format the output to look like a valid Python expression
+        return f"{self.__class__.__name__}({', '.join(field_values)})"
+
+def idx_bin_factory(numFrames):
+
+    class idx_bin(ctypes.Structure):
+        _fields_ = [
+            ("Header", idx_header),
+            ("BuffIdx", idx_buff * numFrames)
+        ]
+
+    return idx_bin
+
+def open_idx(idx_file):
+    with open(idx_file, 'rb') as f:
+        b = f.read()
+
+    ih = idx_header.from_buffer_copy(b)
+    idx_bin = idx_bin_factory(ih.numIdx)
+
+    idx = idx_bin.from_buffer_copy(b)
+
+    return idx
 
 def get_valid_num_frames(idx_file_path: str) -> Tuple[int, int]:
     """
@@ -107,19 +188,15 @@ def get_valid_num_frames(idx_file_path: str) -> Tuple[int, int]:
         idx_file_path: Path to the index file
         
     Returns:
-        Tuple of (num_valid_frames, data_file_size)
+        num_valid_frames
     """
     if not os.path.exists(idx_file_path):
         raise FileNotFoundError(f"Index file not found: {idx_file_path}")
     
-    file_size = os.path.getsize(idx_file_path)
+    idx = open_idx(idx_file_path)
+    num_frames = idx.Header.numIdx
     
-    # Each frame entry in idx file is typically 8 bytes (offset + size)
-    # The exact format may vary, this is an approximation
-    bytes_per_entry = 8
-    num_frames = file_size // bytes_per_entry
-    
-    return num_frames, file_size
+    return num_frames
 
 
 def read_bin_file(file_path: str, frame_idx: int, num_sample_per_chirp: int,
@@ -157,12 +234,12 @@ def read_bin_file(file_path: str, frame_idx: int, num_sample_per_chirp: int,
     # Convert to complex (I + jQ)
     adc_complex = adc_data[0::2] + 1j * adc_data[1::2]
     
-    # Reshape: (numRXPerDevice, numSamplePerChirp, numChirpPerLoop, numLoops)
-    adc_complex = adc_complex.reshape(num_rx_per_device, num_sample_per_chirp, 
-                                       num_chirp_per_loop, num_loops)
+    # Reshape: (numLoops, numChirpPerLoop, numSamplePerChirp, numRXPerDevice)
+    adc_complex = adc_complex.reshape(num_loops, num_chirp_per_loop, 
+                                      num_sample_per_chirp, num_rx_per_device)
     
     # Permute to: (numSamplePerChirp, numLoops, numRXPerDevice, numChirpPerLoop)
-    adc_complex = np.transpose(adc_complex, (1, 3, 0, 2))
+    adc_complex = np.transpose(adc_complex, (2, 0, 3, 1))
     
     return adc_complex
 

@@ -123,7 +123,7 @@ def run_txbf_signal_processing(
         file_struct = get_bin_file_names_with_idx(data_folder_test, file_idx)
         
         idx_file_path = os.path.join(data_folder_test, file_struct.masterIdxFile)
-        num_valid_frames, _ = get_valid_num_frames(idx_file_path)
+        num_valid_frames = get_valid_num_frames(idx_file_path)
         
         if num_frames_to_run:
             num_valid_frames = min(num_valid_frames, num_frames_to_run)
