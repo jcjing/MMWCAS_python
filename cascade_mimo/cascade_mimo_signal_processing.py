@@ -18,6 +18,7 @@ This script processes raw ADC data through the following chain:
 
 import os
 import numpy as np
+import numpy.typing as npt
 import matplotlib
 # Use TkAgg backend for interactive plotting (fallback to Agg if not available)
 try:
@@ -42,7 +43,7 @@ from .modules.sim_top import SimTopConfig
 
 from .utils.data_parse import get_unique_file_idx, get_bin_file_names_with_idx, get_valid_num_frames
 from .utils.json_parser import parse_mmwave_config, get_tx_enable_table, find_mmwave_json
-from .utils.plotting import plot_range_azimuth_2d, plot_3d_point_cloud, plot_range_profile
+from .utils.plotting import plot_range_azimuth_2d, plot_3d_point_cloud, plot_range_profile, parula_map
 
 # Import antenna position constants for range-azimuth plotting
 import sys
@@ -55,7 +56,7 @@ from common.constants import (
 )
 
 
-def compute_azimuth_only_antennas(num_tx: int, num_rx: int) -> np.ndarray:
+def compute_azimuth_only_antennas(TxForMIMOProcess: npt.NDArray, RxForMIMOProcess: npt.NDArray) -> np.ndarray:
     """
     Compute azimuth-only antenna indices from virtual MIMO array.
     Matches MATLAB implementation where antenna_azimuthonly is computed from
@@ -68,18 +69,18 @@ def compute_azimuth_only_antennas(num_tx: int, num_rx: int) -> np.ndarray:
     Returns:
         Array of antenna indices for azimuth-only processing
     """
+    num_tx = len(TxForMIMOProcess)
+    num_rx = len(RxForMIMOProcess)
     # Build virtual array positions using the RX channel order from TI cascade EVM
     # MATLAB: D_RX = TI_Cascade_RX_position_azi(RxForMIMOProcess)
     # where RxForMIMOProcess = [13 14 15 16 1 2 3 4 9 10 11 12 5 6 7 8]
     virtual_ant_azi = []
     virtual_ant_ele = []
     
-    for tx in range(num_tx):
-        for rx_idx in range(num_rx):
-            # Use TI_CASCADE_RX_ID to get the actual RX channel order (convert 1-based to 0-based)
-            rx = TI_CASCADE_RX_ID[rx_idx] - 1
-            virtual_ant_azi.append(TI_CASCADE_TX_POSITION_AZI[tx] + TI_CASCADE_RX_POSITION_AZI[rx])
-            virtual_ant_ele.append(TI_CASCADE_TX_POSITION_ELE[tx] + TI_CASCADE_RX_POSITION_ELE[rx])
+    for tx_chn in TxForMIMOProcess:
+        tx = tx_chn - 1
+        virtual_ant_azi.extend(TI_CASCADE_TX_POSITION_AZI[tx] + TI_CASCADE_RX_POSITION_AZI[RxForMIMOProcess - 1])
+        virtual_ant_ele.extend(TI_CASCADE_TX_POSITION_ELE[tx] + TI_CASCADE_RX_POSITION_ELE[RxForMIMOProcess - 1])
     
     # Find antennas with elevation = 0 (azimuth-only)
     # MATLAB: ind = find(D(:,2)==0); [val ID_unique] = unique(D(ind,1)); antenna_azimuthonly = ind(ID_unique);
@@ -131,7 +132,6 @@ def run_mimo_signal_processing(
     # Parse configuration
     print(f"  Parsing config: {json_file}")
     params = parse_mmwave_config(json_file)
-    tx_enable_table, tx_channel_enabled = get_tx_enable_table(params)
     
     # Get device configuration
     dev_config = params['DevConfig'][1]
@@ -209,7 +209,7 @@ def run_mimo_signal_processing(
     # Compute azimuth-only antenna indices (used for range-azimuth heatmap)
     num_tx_antennas = len(params['TxToEnable'])
     num_rx_antennas = len(params['RxToEnable'])
-    antenna_azimuthonly = compute_azimuth_only_antennas(num_tx_antennas, num_rx_antennas)
+    antenna_azimuthonly = compute_azimuth_only_antennas(params['TxToEnable'], params['RxToEnable'])
     
     frame_count_global = 0
     
@@ -398,17 +398,17 @@ def _update_plots(fig, doppler_fft: np.ndarray, detections: List[Detection],
     # Zero-Doppler line (thick green line on top)
     zero_doppler = sig_integrate.shape[1] // 2
     ax1.plot(range_axis, sig_integrate[:, zero_doppler], '-', c='limegreen', linewidth=1, label='Zero Doppler')
-    
     ax1.set_xlabel('Range (m)')
     ax1.set_ylabel('Receive Power (dB)')
     ax1.set_title(f'Range Profile (zero Doppler - thick green line): frameID {frame_idx}')
     ax1.grid(True)
-    
+    ax1.set_axisbelow(True)
+
     # Range-Doppler map (matches MATLAB's imagesc)
     ax2 = fig.add_subplot(2, 2, 2)
     # MATLAB's imagesc displays matrix as-is: rows=Y-axis (range), columns=X-axis (doppler)
     # Python's imshow does the same, but we need origin='upper' to match MATLAB
-    im = ax2.imshow(sig_integrate, aspect='auto', origin='upper', cmap='jet')
+    im = ax2.imshow(sig_integrate, aspect='auto', origin='upper', cmap=parula_map, interpolation='none')
     cbar = plt.colorbar(im, ax=ax2)
     cbar.set_label('Relative Power (dB)')
     ax2.set_xlabel('Doppler Bin')
@@ -423,12 +423,15 @@ def _update_plots(fig, doppler_fft: np.ndarray, detections: List[Detection],
     
     # MATLAB uses surf(y_axis, x_axis, mag_data) with view(2)
     # This makes y_axis horizontal and x_axis vertical
-    surf = ax3.pcolormesh(y_axis, x_axis, mag_data_display, cmap='jet', shading='auto')
+    surf = ax3.pcolormesh(y_axis, x_axis, mag_data_display, cmap=parula_map, shading='gouraud')
+    # if don't want to use 'gouraud', can use scipy convolve2d to generate edges of y_axis/x_axis and use shading 'flat'
     ax3.set_xlabel('meters')
     ax3.set_ylabel('meters')
     ax3.set_title('range/azimuth heat map static objects')
     ax3.set_ylim(bottom=0)
-    plt.colorbar(surf, ax=ax3)
+    ax3.grid(True, alpha = 0.7, lw = 0.75)
+    ax3.set_axisbelow(True)
+    # plt.colorbar(surf, ax=ax3)
     
     # 3D Point cloud
     if len(xyz_points) > 0:
@@ -438,7 +441,7 @@ def _update_plots(fig, doppler_fft: np.ndarray, detections: List[Detection],
         z = [p['z'] for p in xyz_points]
         v = [p['velocity'] for p in xyz_points]
         
-        scatter = ax4.scatter(x, y, z, c=v, cmap='RdBu', s=45)
+        scatter = ax4.scatter(x, y, z, c=v, cmap=parula_map, s=45)
         ax4.set_xlim(-20, 20)
         ax4.set_ylim(1, 50)
         ax4.set_zlim(-5, 5)
@@ -447,6 +450,8 @@ def _update_plots(fig, doppler_fft: np.ndarray, detections: List[Detection],
         ax4.set_zlabel('Z (m)')
         ax4.set_title('3D Point Cloud')
         plt.colorbar(scatter, ax=ax4, label='Velocity (m/s)')
+
+    fig.set_tight_layout(True)
 
 
 def _save_results(output_file: str, results: Dict[str, Any]):

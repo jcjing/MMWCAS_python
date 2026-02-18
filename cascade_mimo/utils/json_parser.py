@@ -11,6 +11,7 @@ Converted from MATLAB: JsonParser.m
 import json
 import os
 from typing import Dict, Any, List, Optional
+from common.constants import TI_CASCADE_RX_ID
 
 
 def load_mmwave_json(json_file_path: str) -> Dict[str, Any]:
@@ -69,19 +70,19 @@ def parse_mmwave_config(json_file_path: str) -> Dict[str, Any]:
         elif waveform_type == 'continuousWave':
             params['FrameType'] = 2
         
-        # TX channel enable
-        tx_channel_en_str = device_config['rfConfig']['rlChanCfg_t']['txChannelEn']
-        tx_channel_en = int(tx_channel_en_str, 16) if tx_channel_en_str.startswith('0x') else int(tx_channel_en_str)
-        for tx_channel in range(3):
-            if tx_channel_en & (1 << tx_channel):
-                params['TxToEnable'].append(3 * (dev_id - 1) + tx_channel + 1)
+        # # TX channel enable
+        # tx_channel_en_str = device_config['rfConfig']['rlChanCfg_t']['txChannelEn']
+        # tx_channel_en = int(tx_channel_en_str, 16) if tx_channel_en_str.startswith('0x') else int(tx_channel_en_str)
+        # for tx_channel in range(3):
+        #     if tx_channel_en & (1 << tx_channel):
+        #         params['TxToEnable'].append(3 * (dev_id - 1) + tx_channel + 1)
         
         # RX channel enable
-        rx_channel_en_str = device_config['rfConfig']['rlChanCfg_t']['rxChannelEn']
-        rx_channel_en = int(rx_channel_en_str, 16) if rx_channel_en_str.startswith('0x') else int(rx_channel_en_str)
-        for rx_channel in range(4):
-            if rx_channel_en & (1 << rx_channel):
-                params['RxToEnable'].append(4 * (dev_id - 1) + rx_channel + 1)
+        # rx_channel_en_str = device_config['rfConfig']['rlChanCfg_t']['rxChannelEn']
+        # rx_channel_en = int(rx_channel_en_str, 16) if rx_channel_en_str.startswith('0x') else int(rx_channel_en_str)
+        # for rx_channel in range(4):
+        #     if rx_channel_en & (1 << rx_channel):
+        #         params['RxToEnable'].append(4 * (dev_id - 1) + rx_channel + 1)
         
         # Initialize device config
         if dev_id not in params['DevConfig']:
@@ -124,7 +125,10 @@ def parse_mmwave_config(json_file_path: str) -> Dict[str, Any]:
                 'Periodicity': frame_cfg.get('framePeriodicity_msec', 
                               frame_cfg.get('framePeriodicity', 0)),
             }
-    
+
+    tx_enable_table, tx_channel_enabled = get_tx_enable_table(params)
+    params['TxToEnable'] = tx_channel_enabled
+    params['RxToEnable'] = TI_CASCADE_RX_ID         ## fix for parsing to disable unused rx if not all 16 used
     return params
 
 
